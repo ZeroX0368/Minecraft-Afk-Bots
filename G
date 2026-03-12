@@ -1,0 +1,559 @@
+import {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ContainerBuilder,
+  TextDisplayBuilder,
+  SeparatorBuilder,
+  ThumbnailBuilder,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
+  MessageFlags,
+  SeparatorSpacingSize
+} from "discord.js";
+import { createBot } from "mineflayer";
+
+const TOKEN = "";
+const CLIENT_ID = "1388553416061616298";
+const GUILD_ID = "1385273333720940778";
+
+if (!TOKEN) {
+  console.error("[ERROR] Missing DISCORD_TOKEN environment variable.");
+  process.exit(1);
+}
+if (!CLIENT_ID) {
+  console.error("[ERROR] Missing CLIENT_ID environment variable.");
+  process.exit(1);
+}
+
+const registrations = new Map();
+const activeBots = new Map();
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("register")
+    .setDescription("Register a Minecraft bot username for your Discord account")
+    .addStringOption(opt =>
+      opt
+        .setName("username")
+        .setDescription("The Minecraft bot username (3-16 characters, no spaces)")
+        .setRequired(true)
+        .setMinLength(3)
+        .setMaxLength(16)
+    )
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName("minecraft")
+    .setDescription("Control your personal Minecraft bot")
+    .addSubcommand(sub =>
+      sub
+        .setName("bot-join")
+        .setDescription("Connect your Minecraft bot to a server")
+        .addStringOption(opt =>
+          opt
+            .setName("address")
+            .setDescription("Server IP address or hostname")
+            .setRequired(true)
+        )
+        .addIntegerOption(opt =>
+          opt
+            .setName("port")
+            .setDescription("Server port (default: 25565)")
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(65535)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("bot-status")
+        .setDescription("Check the status of your Minecraft bot")
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("bot-leave")
+        .setDescription("Disconnect your Minecraft bot from the server")
+    )
+    .toJSON()
+];
+
+async function deployCommands() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  try {
+    console.log("[Bot] Deploying slash commands...");
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+        body: commands
+      });
+      console.log(`[Bot] Commands deployed to guild: ${GUILD_ID}`);
+    } else {
+      await rest.put(Routes.applicationCommands(CLIENT_ID), {
+        body: commands
+      });
+      console.log("[Bot] Commands deployed globally.");
+    }
+  } catch (err) {
+    console.error("[Bot] Failed to deploy commands:", err);
+  }
+}
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.once("ready", async () => {
+  console.log(`[Bot] Logged in as ${client.user.tag}`);
+  await deployCommands();
+});
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName, user } = interaction;
+  const userId = user.id;
+
+  try {
+    if (commandName === "register") {
+      await handleRegister(interaction, userId);
+    } else if (commandName === "minecraft") {
+      const sub = interaction.options.getSubcommand();
+      if (sub === "bot-join") {
+        await handleBotJoin(interaction, userId);
+      } else if (sub === "bot-status") {
+        await handleBotStatus(interaction, userId);
+      } else if (sub === "bot-leave") {
+        await handleBotLeave(interaction, userId);
+      }
+    }
+  } catch (err) {
+    console.error(`[Bot] Command error (${commandName}):`, err);
+    const errContainer = new ContainerBuilder();
+    errContainer.addTextDisplayComponents(text =>
+      text.setContent(`## Internal Error\n\`\`\`\n${err.message}\n\`\`\``)
+    );
+    try {
+      if (interaction.deferred) {
+        await interaction.editReply({
+          components: [errContainer],
+          flags: MessageFlags.IsComponentsV2
+        });
+      } else {
+        await interaction.reply({
+          components: [errContainer],
+          flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+        });
+      }
+    } catch {}
+  }
+});
+
+async function handleRegister(interaction, userId) {
+  const username = interaction.options.getString("username");
+
+  if (/\s/.test(username)) {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(`## ❌ Invalid Username\nMinecraft usernames cannot contain spaces.\n\nPlease use \`/register <username>\` with a valid name.`)
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const existing = registrations.get(userId);
+  const activeBot = activeBots.get(userId);
+
+  if (activeBot && activeBot.bot) {
+    try {
+      activeBot.bot.quit();
+    } catch {}
+    activeBots.delete(userId);
+  }
+
+  registrations.set(userId, username);
+
+  const container = new ContainerBuilder();
+  container.addTextDisplayComponents(text =>
+    text.setContent(`## ✅ Bot Registered`)
+  );
+  container.addSeparatorComponents(sep =>
+    sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+  );
+  container.addTextDisplayComponents(text =>
+    text.setContent(
+      [
+        `**Bot Username:** \`${username}\``,
+        `**Owner:** <@${userId}>`,
+        ``,
+        existing
+          ? `> ⚠️ Previous bot **\`${existing}\`** has been replaced.`
+          : `> You can now use \`/minecraft bot-join <address> [port]\` to connect to a server.`
+      ].join("\n")
+    )
+  );
+
+  await interaction.reply({
+    components: [container],
+    flags: MessageFlags.IsComponentsV2
+  });
+}
+
+async function handleBotJoin(interaction, userId) {
+  const botName = registrations.get(userId);
+
+  if (!botName) {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        `## ❌ Not Registered\nYou must register a Minecraft bot first.\n\nUse \`/register <username>\` to create your bot.`
+      )
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const existing = activeBots.get(userId);
+  if (existing && (existing.status === "connected" || existing.status === "connecting")) {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        `## ⚠️ Bot Already Active\nYour bot **\`${botName}\`** is already connected to \`${existing.address}:${existing.port}\`.\n\nUse \`/minecraft bot-leave\` to disconnect first.`
+      )
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const address = interaction.options.getString("address");
+  const port = interaction.options.getInteger("port") ?? 25565;
+
+  await interaction.deferReply({ flags: MessageFlags.IsComponentsV2 });
+
+  let resolved = false;
+
+  const botEntry = {
+    bot: null,
+    address,
+    port,
+    username: botName,
+    status: "connecting",
+    connectedAt: null,
+    health: null,
+    food: null
+  };
+  activeBots.set(userId, botEntry);
+
+  await new Promise(resolve => {
+    const bot = createBot({
+      host: address,
+      port,
+      username: botName,
+      auth: "offline",
+      version: false,
+      hideErrors: true
+    });
+
+    botEntry.bot = bot;
+
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
+    }, 5000);
+
+    bot.once("spawn", () => {
+      botEntry.status = "connected";
+      botEntry.connectedAt = new Date();
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+
+    bot.on("health", () => {
+      if (bot.health !== undefined) botEntry.health = Math.round(bot.health * 10) / 10;
+      if (bot.food !== undefined) botEntry.food = bot.food;
+    });
+
+    bot.on("kicked", reason => {
+      const reasonStr = typeof reason === "string" ? reason : JSON.stringify(reason);
+      console.log(`[Bot:${botName}] Kicked: ${reasonStr}`);
+      botEntry.status = "disconnected";
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+
+    bot.on("end", () => {
+      console.log(`[Bot:${botName}] Disconnected.`);
+      if (botEntry.status !== "disconnected") botEntry.status = "disconnected";
+    });
+
+    bot.on("error", err => {
+      console.error(`[Bot:${botName}] Error: ${err.message}`);
+      botEntry.status = "error";
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+  });
+
+  const container = new ContainerBuilder();
+
+  if (botEntry.status === "connected") {
+    container.addTextDisplayComponents(text =>
+      text.setContent(`## 🟢 Bot Connected`)
+    );
+    container.addSeparatorComponents(sep =>
+      sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+    );
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        [
+          `**Bot:** \`${botName}\``,
+          `**Server:** \`${address}:${port}\``,
+          `**Status:** 🟢 Connected`,
+          `**Owner:** <@${userId}>`,
+          ``,
+          `> Use \`/minecraft bot-status\` to check status anytime.`
+        ].join("\n")
+      )
+    );
+  } else if (botEntry.status === "connecting") {
+    container.addTextDisplayComponents(text =>
+      text.setContent(`## 🟡 Bot Connecting`)
+    );
+    container.addSeparatorComponents(sep =>
+      sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+    );
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        [
+          `**Bot:** \`${botName}\``,
+          `**Server:** \`${address}:${port}\``,
+          `**Status:** 🟡 Still connecting...`,
+          `**Owner:** <@${userId}>`,
+          ``,
+          `> The bot is taking longer than expected. Check back with \`/minecraft bot-status\`.`
+        ].join("\n")
+      )
+    );
+  } else {
+    activeBots.delete(userId);
+    container.addTextDisplayComponents(text =>
+      text.setContent(`## 🔴 Failed to Connect`)
+    );
+    container.addSeparatorComponents(sep =>
+      sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+    );
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        [
+          `**Bot:** \`${botName}\``,
+          `**Server:** \`${address}:${port}\``,
+          `**Status:** ❌ ${botEntry.status === "error" ? "Error" : "Disconnected/Kicked"}`,
+          ``,
+          `> Double-check the server address and port, then try again.`
+        ].join("\n")
+      )
+    );
+  }
+
+  await interaction.editReply({
+    components: [container],
+    flags: MessageFlags.IsComponentsV2
+  });
+}
+
+async function handleBotStatus(interaction, userId) {
+  const botName = registrations.get(userId);
+
+  if (!botName) {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        `## ❌ Not Registered\nYou have no registered bot.\n\nUse \`/register <username>\` to get started.`
+      )
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const botEntry = activeBots.get(userId);
+  const container = new ContainerBuilder();
+
+  container.addTextDisplayComponents(text =>
+    text.setContent(`## 📊 Bot Status`)
+  );
+  container.addSeparatorComponents(sep =>
+    sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+  );
+
+  if (!botEntry || botEntry.status === "disconnected") {
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        [
+          `**Bot:** \`${botName}\``,
+          `**Status:** ⚫ Offline`,
+          `**Owner:** <@${userId}>`,
+          ``,
+          `> Use \`/minecraft bot-join <address> [port]\` to connect your bot.`
+        ].join("\n")
+      )
+    );
+  } else {
+    const statusEmoji =
+      botEntry.status === "connected"
+        ? "🟢"
+        : botEntry.status === "connecting"
+        ? "🟡"
+        : botEntry.status === "error"
+        ? "🔴"
+        : "⚫";
+
+    const statusLabel = capitalize(botEntry.status);
+
+    const uptime =
+      botEntry.connectedAt && botEntry.status === "connected"
+        ? formatUptime(Date.now() - botEntry.connectedAt.getTime())
+        : "N/A";
+
+    const healthBar =
+      botEntry.health !== null
+        ? buildBar(botEntry.health, 20, "❤️", "🖤")
+        : null;
+
+    const foodBar =
+      botEntry.food !== null
+        ? buildBar(botEntry.food, 20, "🍗", "⬜")
+        : null;
+
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        [
+          `**Bot:** \`${botName}\``,
+          `**Status:** ${statusEmoji} ${statusLabel}`,
+          `**Server:** \`${botEntry.address}:${botEntry.port}\``,
+          `**Uptime:** ${uptime}`,
+          healthBar ? `**Health:** ${healthBar} (${botEntry.health}/20)` : null,
+          foodBar ? `**Food:** ${foodBar} (${botEntry.food}/20)` : null,
+          `**Owner:** <@${userId}>`
+        ]
+          .filter(Boolean)
+          .join("\n")
+      )
+    );
+  }
+
+  await interaction.reply({
+    components: [container],
+    flags: MessageFlags.IsComponentsV2
+  });
+}
+
+async function handleBotLeave(interaction, userId) {
+  const botName = registrations.get(userId);
+
+  if (!botName) {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        `## ❌ Not Registered\nYou have no registered bot.\n\nUse \`/register <username>\` to get started.`
+      )
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const botEntry = activeBots.get(userId);
+
+  if (!botEntry || botEntry.status === "disconnected") {
+    const container = new ContainerBuilder();
+    container.addTextDisplayComponents(text =>
+      text.setContent(
+        `## ⚠️ Bot Not Connected\nYour bot **\`${botName}\`** is not currently connected to any server.`
+      )
+    );
+    return await interaction.reply({
+      components: [container],
+      flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral
+    });
+  }
+
+  const { address, port } = botEntry;
+
+  try {
+    botEntry.bot.quit();
+  } catch {}
+
+  activeBots.delete(userId);
+
+  const container = new ContainerBuilder();
+  container.addTextDisplayComponents(text =>
+    text.setContent(`## 🔌 Bot Disconnected`)
+  );
+  container.addSeparatorComponents(sep =>
+    sep.setSpacing(SeparatorSpacingSize.Small).setDivider(true)
+  );
+  container.addTextDisplayComponents(text =>
+    text.setContent(
+      [
+        `**Bot:** \`${botName}\``,
+        `**Disconnected from:** \`${address}:${port}\``,
+        `**Owner:** <@${userId}>`,
+        ``,
+        `> Use \`/minecraft bot-join <address> [port]\` to reconnect.`
+      ].join("\n")
+    )
+  );
+
+  await interaction.reply({
+    components: [container],
+    flags: MessageFlags.IsComponentsV2
+  });
+}
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m ${s % 60}s`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function capitalize(str) {
+  if (!str) return "";
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+function buildBar(value, max, fillChar, emptyChar) {
+  const total = 10;
+  const filled = Math.round((value / max) * total);
+  return fillChar.repeat(filled) + emptyChar.repeat(total - filled);
+}
+
+process.on("uncaughtException", err =>
+  console.error("[Bot] Uncaught Exception:", err)
+);
+process.on("unhandledRejection", reason =>
+  console.error("[Bot] Unhandled Rejection:", reason)
+);
+
+client.login(TOKEN);
